@@ -11,6 +11,7 @@ import os
 import time
 
 CELL = 3.0  # nav / solid grid size, metres
+LCELL = float(os.environ.get("BOT_LCELL", "1.0"))  # line-of-sight grid size, metres
 
 
 def _scan_fill(ring, cell, x0, y0, nx, ny, visit):
@@ -84,6 +85,22 @@ class World:
                 if pt > top[k]:
                     top[k] = pt
             _scan_fill(p["ring"], CELL, self.x0, self.y0, nx, ny, visit)
+        # a finer grid of solid tops for line of sight: 3 m cells lose corners and narrow gaps
+        self.lnx = int((b["maxX"] - b["minX"]) / LCELL) + 1
+        self.lny = int((b["maxY"] - b["minY"]) / LCELL) + 1
+        lnx, lny = self.lnx, self.lny
+        ltop = array.array("f", [-1e9]) * (lnx * lny)
+        for p in w["prisms"]:
+            if p["kind"] == "bridge":
+                continue
+            pt = p["top"]
+
+            def lvisit(i, j, pt=pt):
+                k = j * lnx + i
+                if pt > ltop[k]:
+                    ltop[k] = pt
+            _scan_fill(p["ring"], LCELL, self.x0, self.y0, lnx, lny, lvisit)
+        self.ltop = ltop
         # walls that block movement (fences); line-rasterised
         self.fence = bytearray(n)
         for br in w.get("barriers", []):
@@ -159,7 +176,7 @@ class World:
         c = self.cell(x, y)
         return c is not None and self.raw[c] == 0
 
-    def los(self, a, b, step=2.0):
+    def los(self, a, b, step=1.0):
         """True if the segment a->b (3D) clears every solid top and the terrain."""
         if not self.ok:
             return True
@@ -168,12 +185,12 @@ class World:
         n = int(d / step)
         if n < 2:
             return True
-        top, nx, ny, x0, y0 = self.top, self.nx, self.ny, self.x0, self.y0
+        top, nx, ny, x0, y0 = self.ltop, self.lnx, self.lny, self.x0, self.y0
         for s in range(1, n):
             f = s / n
             x, y, z = a[0] + dx * f, a[1] + dy * f, a[2] + dz * f
-            i = int((x - x0) / CELL)
-            j = int((y - y0) / CELL)
+            i = int((x - x0) / LCELL)
+            j = int((y - y0) / LCELL)
             if 0 <= i < nx and 0 <= j < ny and top[j * nx + i] > z:
                 return False
             if s % 3 == 0 and self.terrain(x, y) > z:

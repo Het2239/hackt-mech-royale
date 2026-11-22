@@ -38,6 +38,8 @@ P = {
     "no_cover_fight": 1,
     "trust_vis": 0,
     "quiet": 1,
+    "v_npc": 85.0,             # farm drones (2 cubes each) while under the cube cap
+    "npc_shoot_d": 70.0,
     "laser_first_hp": 2.0,     # (off by default) engage any LOS mech within laser_first_d while above this HP
     "laser_first_d": 150.0,                # walk quietly in the opening
     "grab_d": 30.0,            # mid-fight, detour to a better weapon this close
@@ -662,6 +664,10 @@ class Brain:
         self.kill_spots = [k for k in self.kill_spots if t - k[0] < 20 and d2((k[1], k[2]), (x, y)) > 5]
         for k in self.kill_spots:
             cands.append((("k", k[0]), (k[1], k[2], me["pos"][2]), 90, 110))
+        if hpf > 0.5 and not danger and ncubes < self.cube_cap and P["v_npc"] > 0:
+            for n in obs.get("mechs") or []:
+                if n.get("kind") == "npc":
+                    cands.append((("n", n["id"]), n["pos"], P["v_npc"], 140))
         if hpf > 0.5 and not danger:
             for c in obs.get("crates") or []:
                 cands.append((("x", c["id"]), c["pos"], 0.6 * (75 if ncubes < self.cube_cap else 25) + (P["v_crate_noweap"] if sec_kind is None else 0), 90))
@@ -684,6 +690,11 @@ class Brain:
         if best is None:
             self.loot_id = None
             return None
+        if best[0][0] == "n":
+            pos = best[1]
+            dd = d2(pos, (x, y))
+            if dd < P["npc_shoot_d"] * 0.6:
+                best = (best[0], (x, y))  # in range: hold and shoot
         if best[0] != self.loot_id:
             self.loot_id, self.loot_since = best[0], t
         elif t - self.loot_since > 30:
@@ -749,7 +760,8 @@ class Brain:
                     aim = self.aim_at(me, cm, None, 1.2 / self.height)
                     fire0 = abs(wrap(cur[0] - aim[0])) < 0.05 and abs(cur[1] - aim[1]) < 0.08
             if aim is None:
-                close = [n for n in npcs if d2(n["pos"], me["pos"]) < 45 and self.can_see(me["pos"], n["pos"])]
+                rng_ = P["npc_shoot_d"] if (mode == "loot" and hpf > 0.5) else 45
+                close = [n for n in npcs if d2(n["pos"], me["pos"]) < rng_ and self.can_see(me["pos"], n["pos"])]
                 if close:
                     n = min(close, key=lambda n: d2(n["pos"], me["pos"]))
                     aim = self.aim_at(me, n, self.w["gun"]["speed"], 0.2)
