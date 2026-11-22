@@ -21,6 +21,24 @@ UPGRADE_ORDER = [
 BAND = {"laser": (55.0, 110.0), "lightning": (12.0, 30.0), "gun": (35.0, 75.0)}  # preferred fight range
 
 
+P = {
+    "retreat_hp": 0.38,      # start disengaging below this HP fraction
+    "recover_hp": 0.85,      # stop disengaging above this
+    "multi_retreat_hp": 0.65,  # disengage earlier when 2+ mechs are hitting us
+    "engage_range": 70.0,    # fight anything this close even if it has not attacked us
+    "hunt_hp": 0.6,          # chase a lost target only while we are above this HP fraction
+    "hunt_s": 6.0,           # how long a lost target stays worth chasing
+    "lead": 0.6,             # fraction of target velocity to lead the gun by
+    "cautious_t": 265.0,     # after this match time, stop chasing and hold the circle
+    "finish_ratio": 0.6,     # keep fighting while retreating if target hp < ratio * ours
+}
+try:
+    import json as _json, os as _os
+    P.update(_json.loads(_os.environ.get("BOT_PARAMS", "{}")))
+except Exception:
+    pass
+
+
 def wrap(a):
     return (a + math.pi) % TAU - math.pi
 
@@ -195,6 +213,8 @@ class Brain:
             dx, dy = x - nc[0], y - nc[1]
             d = math.hypot(dx, dy)
             inner = max(nr * 0.55, nr - 60) if nr > 30 else nr * 0.3
+            if t > P["cautious_t"]:
+                inner = min(inner, nr * 0.35)  # late: hold near the centre of the closing circle
             if d <= inner:
                 self.zone_goal = (x, y)
             else:
@@ -289,7 +309,7 @@ class Brain:
             if not m["_los"]:
                 continue
             mhp = m.get("hp", 1400) / max(m.get("max_hp", 1400), 1)
-            engage = (self.ffa or t - self.attackers.get(m["id"], -99) < 10 or m["_d"] < 70
+            engage = (self.ffa or t - self.attackers.get(m["id"], -99) < 10 or m["_d"] < P["engage_range"]
                       or mhp < 0.35 or t - self.my_targets.get(m["id"], -99) < 6)
             if not engage or m["_d"] > 230:
                 continue
@@ -299,11 +319,12 @@ class Brain:
         self.target_id = target["id"] if target else None
 
         # ---- retreat state machine (hysteresis), unless the target is nearly dead
-        if hpf < 0.38:
+        recent_attackers = [a for a, ta in self.attackers.items() if t - ta < 3 and a not in self.dead_ids]
+        if hpf < P["retreat_hp"] or (len(recent_attackers) >= 2 and hpf < P["multi_retreat_hp"]):
             self.retreating = True
-        elif hpf > 0.85:
+        elif hpf > P["recover_hp"]:
             self.retreating = False
-        finishing = target is not None and target.get("hp", 1400) < 0.6 * me["hp"] and target["_d"] < 90
+        finishing = target is not None and target.get("hp", 1400) < P["finish_ratio"] * me["hp"] and target["_d"] < 90
         retreat = self.retreating and not finishing and (hunters or t - self.attackers_last() < 6)
 
         zgoal, urgent, outside = self.zone_target(me, obs)
@@ -350,6 +371,10 @@ class Brain:
         elif target is not None:
             mode = "fight"
             act["move"] = self.fight_move(me, t, target, sec_kind)
+        elif self.hunt_target(me, t, hpf, obs) is not None:
+            mode = "hunt"
+            hp_ = self.hunt_target(me, t, hpf, obs)
+            act["move"] = self.go(me, t, hp_[0], hp_[1])
         else:
             goal = self.loot_goal(me, obs, visible, hpf, sec_kind, t)
             if goal is not None:
@@ -385,6 +410,29 @@ class Brain:
         except Exception:
             pass
         return act
+
+    def hunt_target(self, me, t, hpf, obs):
+        """Last known position of a mech we were trading with, if worth chasing."""
+        if hpf < P["hunt_hp"] or (t > P["cautious_t"] and not self.ffa):
+            return None
+        best, bs = None, 1e9
+        nc, nr = obs["zone"]["next_center"], obs["zone"]["next_radius"]
+        for mid, (ts, pos, hp, _w) in self.last_seen.items():
+            if mid in self.dead_ids or t - ts > P["hunt_s"]:
+                continue
+            traded = t - self.my_targets.get(mid, -99) < P["hunt_s"] or t - self.attackers.get(mid, -99) < P["hunt_s"]
+            if not traded or hp > me["hp"] * 1.1:
+                continue
+            if math.hypot(pos[0] - nc[0], pos[1] - nc[1]) > nr + 30:
+                continue
+            dd = d2(pos, me["pos"]) + 0.1 * hp
+            if dd < bs:
+                best, bs = pos, dd
+        return best
+
+    def cube_bonus(self, me):
+        c = self.cfg["cubes"]
+        return min(me.get("cubes", 0), c.get("stat_cap", 10)) * c.get("damage_per_cube", 0.04)
 
     def attackers_last(self):
         return max(self.attackers.values(), default=-99)
@@ -485,11 +533,12 @@ class Brain:
         sec_kind = sec["kind"] if sec else None
         aim = None
         fire0 = fire1 = False
-        holdfire = retreat  # dealing damage resets our regen timer
+        # dealing damage resets our regen timer, but always shoot back at a mech in our face
+        holdfire = retreat and not (target is not None and target["_d"] < 60)
         if target is not None:
             tv = target.get("vel") or [0, 0, 0]
             gun_speed = (gun or {}).get("stats", {}).get("speed", self.w["gun"]["speed"]) if gun else 252
-            aim = self.aim_at(me, target["pos"], tv, gun_speed, lead=0.6)
+            aim = self.aim_at(me, target["pos"], tv, gun_speed, lead=P["lead"])
             d = target["_d"]
             if sec_kind == "laser" and sec.get("charge", 0) > 0.35:
                 aim = self.aim_at(me, target["pos"], tv)  # hitscan: no lead while the beam is about to go
@@ -503,10 +552,21 @@ class Brain:
                 if gun and gun.get("kind") == "gun" and d < (gun.get("stats", {}).get("range", 230)) and on:
                     fire0 = (gun.get("reload", 0) or 0) <= 0
                 if sec_kind == "laser":
-                    lr = sec.get("stats", {}).get("range", 280)
-                    charging = sec.get("charge", 0) > 0
+                    st = sec.get("stats", {})
+                    lr = st.get("range", 280)
+                    ch = sec.get("charge", 0) or 0
+                    charging = ch > 0
                     if d < lr and (yaw_err < 0.25 or charging) and sec.get("cooldown", 0) <= 0.05:
                         fire1 = True
+                    # release early (fires on release) when the partial charge is already lethal and we are on target
+                    full, mn = st.get("charge", 0.75), st.get("min_charge", 0.15)
+                    if charging and ch >= mn and on:
+                        frac = st.get("min_frac", 0.35) + (1 - st.get("min_frac", 0.35)) * min(1.0, (ch - mn) / max(full - mn, 1e-3))
+                        dmg = st.get("damage", 315) * frac * (1 + self.cube_bonus(me))
+                        if dmg >= target.get("hp", 1400) + 5:
+                            fire1 = False
+                    if charging and not (target["_los"]) and ch >= mn:
+                        fire1 = True  # keep holding; never dump a charge into a wall
                 elif sec_kind == "lightning":
                     st = sec.get("stats", {})
                     cone = math.radians(st.get("cone_deg", 30)) / 2
@@ -546,6 +606,8 @@ class Brain:
                         self.scan_yaw = wrap(self.scan_yaw + 0.25)
                         aim = [self.scan_yaw, 0.0]
             # keep laser charge only while a target is up
+        if target is None and sec_kind == "laser" and (sec.get("charge", 0) or 0) > 0 and not holdfire:
+            fire1 = True  # target ducked: keep the charge up rather than dumping it
         act["aim"] = [wrap(aim[0]), max(-0.6, min(1.2, aim[1]))]
         act["fire"] = [bool(fire0), bool(fire1)]
         if gun and gun.get("ammo", 12) < gun.get("stats", {}).get("mag", 12) * 0.5 and target is None and (gun.get("reload", 0) or 0) <= 0:
