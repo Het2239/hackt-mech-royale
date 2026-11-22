@@ -99,6 +99,22 @@ class World:
                         self.fence[c] = 1
         # walkable: no solid rising more than a step above the ground, then inflated by one cell for the body
         raw = bytearray(n)
+        # terrain too steep to walk (retaining walls, embankments, the stadium bowl): any 1 m vertex step
+        # above what step_up + max slope allow marks the containing nav cell
+        lim = (self.step_up + 0.15) / self.tscale
+        th, tnx, tny = self.th, self.tnx, self.tny
+        for j in range(tny - 1):
+            row = j * tnx
+            cy = int((self.ty0 + j * self.tstep - self.y0) / CELL)
+            if not 0 <= cy < ny:
+                continue
+            for i in range(tnx - 1):
+                k = row + i
+                h0 = th[k]
+                if abs(th[k + 1] - h0) > lim or abs(th[k + tnx] - h0) > lim:
+                    cx = int((self.tx0 + i * self.tstep - self.x0) / CELL)
+                    if 0 <= cx < nx:
+                        raw[cy * nx + cx] = 1
         for k in range(n):
             if self.fence[k] or top[k] > self.ground[k] + self.step_up + 0.3:
                 raw[k] = 1

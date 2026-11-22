@@ -36,7 +36,10 @@ P = {
     "v_weapon": 130.0, "v_laser": 320.0, "laser_seek": 240.0, "v_crate_noweap": 40.0,
     "scan": 1.0,
     "no_cover_fight": 1,
-    "trust_vis": 0,               # sweep the torso while looking for a weapon
+    "trust_vis": 0,
+    "quiet": 1,                # walk quietly in the opening
+    "grab_d": 30.0,            # mid-fight, detour to a better weapon this close
+               # sweep the torso while looking for a weapon
 }
 try:
     P.update(json.loads(os.environ.get("BOT_PARAMS", "{}")))
@@ -403,6 +406,10 @@ class Brain:
             else:
                 act["move"] = self.steer(me, math.atan2(y - threats[0]["pos"][1], x - threats[0]["pos"][0]))
                 boost = me["energy"] > 10
+        elif target is not None and self.grab_spot(me, sec_kind) is not None:
+            mode = "grab"
+            g = self.grab_spot(me, sec_kind)
+            act["move"] = self.go(me, t, g[0], g[1], tol=0.5)
         elif target is not None:
             mode = "fight"
             act["move"] = self.fight_move(me, t, target, mechs, obs, gun, sec_kind, hpf, len(near))
@@ -424,7 +431,7 @@ class Brain:
                 boost = zone["next_radius"] < 18
             else:
                 act["move"] = self.go(me, t, *zgoal)
-            if opening and mode in ("rotate", "loot") and not boost:
+            if P["quiet"] and opening and mode in ("rotate", "loot") and not boost:
                 act["move"] = [act["move"][0] * self.quiet, act["move"][1] * self.quiet]
 
         # stuck detection
@@ -456,6 +463,16 @@ class Brain:
         return act
 
     # ------------------------------------------------------------------ behaviours
+    def grab_spot(self, me, sec_kind):
+        cur = SECONDARY_PREF.get(sec_kind, 0) if sec_kind else 0
+        best, bd = None, P["grab_d"]
+        for pp, pk, _ts in self.known_pickups.values():
+            if SECONDARY_PREF.get(pk, -2) > max(cur, 0) and abs(pp[2] - me["pos"][2]) < 3.2:
+                d = d2(pp, me["pos"])
+                if d < bd:
+                    best, bd = pp, d
+        return best
+
     def hunt_target(self, me, t, hpf, obs):
         if hpf < P["hunt_hp"]:
             return None
@@ -705,6 +722,9 @@ class Brain:
                         dmg *= self.cfg["mech"].get("rear_mult", 1.5)
                     if dmg * P["lethal_k"] >= target.get("hp", 1400):
                         fire1 = False  # release now: partial charge kills
+                # the laser fires on release; held at full charge it only fires on its own after hold_s
+                if ch >= full - 1e-6 and (on or ch >= full + st.get("hold_s", 2) - 0.3):
+                    fire1 = False
             elif sec_kind == "lightning":
                 st = sec.get("stats", {})
                 cone = math.radians(st.get("cone_deg", 30)) / 2
