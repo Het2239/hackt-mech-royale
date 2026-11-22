@@ -33,11 +33,17 @@ P = {
     "latency": 0.075,
     "cautious_t": 265.0,
     "w_los": 45.0, "w_exposed": 30.0, "w_strafe": 9.0,
+    "v_weapon": 130.0, "v_laser": 320.0, "laser_seek": 240.0, "v_crate_noweap": 40.0,
+    "scan": 1.0,
+    "no_cover_fight": 1,
+    "trust_vis": 0,               # sweep the torso while looking for a weapon
 }
 try:
     P.update(json.loads(os.environ.get("BOT_PARAMS", "{}")))
 except Exception:
     pass
+
+LOG = open(os.environ["BOT_LOG"], "a") if os.environ.get("BOT_LOG") else None
 
 SECONDARY_PREF = {"laser": 3, "lightning": 2, "mortar": -1}  # never carry the mortar: cookoff + loud
 UPGRADE_ORDER = [
@@ -116,6 +122,7 @@ class Brain:
         self.loot_id = None
         self.loot_since = 0.0
         self.loot_ban = {}
+        self.known_pickups = {}  # id -> (pos, kind, t_seen); remembered after we look away
 
     # ------------------------------------------------------------------ geometry helpers
     def eye_of(self, p):
@@ -287,10 +294,18 @@ class Brain:
         if sec_kind == "mortar" and "take" not in act:
             act["drop"] = 1
 
+        seen_ids = set()
+        for p in obs.get("pickups") or []:
+            self.known_pickups[p["id"]] = (p["pos"], p["kind"], t)
+            seen_ids.add(p["id"])
+        for pid, (pp, pk, ts) in list(self.known_pickups.items()):
+            if pid not in seen_ids and (d2(pp, me["pos"]) < 25 or t - ts > 90):
+                del self.known_pickups[pid]  # should be visible from here but is not: gone
+
         # ---- perception
         for m in mechs:
             m["_d"] = d2(m["pos"], me["pos"])
-            m["_los"] = m["_d"] < 260 and self.can_see(me["pos"], m["pos"])
+            m["_los"] = m["_d"] < 260 and (P["trust_vis"] or self.can_see(me["pos"], m["pos"]))
             m["_hpf"] = m.get("hp", 1400) / max(m.get("max_hp", 1400), 1)
             dx, dy = x - m["pos"][0], y - m["pos"][1]
             dd = max(m["_d"], 0.1)
@@ -381,9 +396,13 @@ class Brain:
                 self.cover_t = t
             if self.cover:
                 act["move"] = self.go(me, t, self.cover[0], self.cover[1], tol=1.8)
+                boost = me["energy"] > 10
+            elif target is not None and P["no_cover_fight"]:
+                mode = "fight"  # nowhere to hide: running only exposes our back (x1.5)
+                act["move"] = self.fight_move(me, t, target, mechs, obs, gun, sec_kind, hpf, len(near))
             else:
                 act["move"] = self.steer(me, math.atan2(y - threats[0]["pos"][1], x - threats[0]["pos"][0]))
-            boost = me["energy"] > 10
+                boost = me["energy"] > 10
         elif target is not None:
             mode = "fight"
             act["move"] = self.fight_move(me, t, target, mechs, obs, gun, sec_kind, hpf, len(near))
@@ -424,6 +443,11 @@ class Brain:
         act["boost"] = bool(boost and me["energy"] > 8)
 
         self.aim_and_fire(act, me, t, target, mechs, npcs, obs, gun, sec, mode, hpf)
+        if LOG and int(t * 10) % 10 == 0:
+            kp = sorted((d2(pp, me["pos"]), k) for pp, k, _ in self.known_pickups.values())[:2]
+            LOG.write(f"{t:.0f} {mode} hp{hpf:.2f} sec={sec_kind} pk={[(round(a), b) for a, b in kp]} vis={len(obs.get('pickups') or [])} "
+                      f"cr={len(obs.get('crates') or [])} tgt={target and round(target['_d'])} near={len(near)} take={act.get('take')} ev={[e.get('type') for e in obs.get('events') or []]}\n")
+            LOG.flush()
         try:
             import mechfight as mf
             mf.draw.label(f"{mode} hp{hpf:.2f} k{self.kills}{' ffa' if self.ffa else ''}")
@@ -525,7 +549,7 @@ class Brain:
     def pref_dist(self, me, target, gun, sec_kind, hpf, crowd):
         if sec_kind == "laser":
             pref = P["pref_laser"]
-        elif sec_kind == "lightning" and me["energy"] > 12:
+        elif sec_kind == "lightning" and me["energy"] > 12 and (target["_d"] < self.light_r + 25 or target["_hpf"] < 0.5):
             pref = P["pref_lightning"]
         else:
             pref = P["pref_gun"]
@@ -604,13 +628,13 @@ class Brain:
         danger = any(m["_d"] < 90 for m in mechs)
         cur = SECONDARY_PREF.get(sec_kind, 0) if sec_kind else 0
         cands = []
-        for p in obs.get("pickups") or []:
-            pv = SECONDARY_PREF.get(p["kind"], -2)
+        for pid, (ppos, pkind, _ts) in self.known_pickups.items():
+            pv = SECONDARY_PREF.get(pkind, -2)
             if pv > max(cur, 0):
-                v = 130 if sec_kind is None else 60
-                if p["kind"] == "laser":
-                    v = max(v, 150)
-                cands.append((("p", p["id"]), p["pos"], v, 240 if p["kind"] == "laser" else 160))
+                v = P["v_weapon"] if sec_kind is None else 60
+                if pkind == "laser":
+                    v = max(v, P["v_laser"])
+                cands.append((("p", pid), ppos, v, P["laser_seek"] if pkind == "laser" else 160))
         ncubes = me.get("cubes", 0)
         for c in obs.get("cubes") or []:
             cands.append((("c", c["id"]), c["pos"], 75 if ncubes < self.cube_cap else 25, 105))
@@ -619,7 +643,7 @@ class Brain:
             cands.append((("k", k[0]), (k[1], k[2], me["pos"][2]), 90, 110))
         if hpf > 0.5 and not danger:
             for c in obs.get("crates") or []:
-                cands.append((("x", c["id"]), c["pos"], 0.6 * (75 if ncubes < self.cube_cap else 25) + (40 if sec_kind is None else 0), 90))
+                cands.append((("x", c["id"]), c["pos"], 0.6 * (75 if ncubes < self.cube_cap else 25) + (P["v_crate_noweap"] if sec_kind is None else 0), 90))
         best, bu = None, 0.0
         for key, pos, v, rad in cands:
             d = d2(pos, (x, y))
@@ -716,6 +740,9 @@ class Brain:
                 snd = [s for s in obs.get("sounds") or [] if s.get("kind") not in ("npc_gun", "crate", "drop")]
                 if snd:
                     aim = [min(snd, key=lambda s: s.get("age", 0))["bearing"], 0.0]
+                elif P["scan"] and (sec_kind != "laser") and mode in ("rotate", "loot"):
+                    self.scan_yaw = wrap(cur[0] + 0.4)
+                    aim = [self.scan_yaw, 0.0]
                 elif math.hypot(*act["move"]) > 0.1:
                     aim = [math.atan2(act["move"][1], act["move"][0]), 0.0]
                 else:
