@@ -37,7 +37,9 @@ P = {
     "scan": 1.0,
     "no_cover_fight": 1,
     "trust_vis": 0,
-    "quiet": 1,                # walk quietly in the opening
+    "quiet": 1,
+    "laser_first_hp": 2.0,     # (off by default) engage any LOS mech within laser_first_d while above this HP
+    "laser_first_d": 150.0,                # walk quietly in the opening
     "grab_d": 30.0,            # mid-fight, detour to a better weapon this close
                # sweep the torso while looking for a weapon
 }
@@ -333,6 +335,8 @@ class Brain:
             else:
                 ok = (d < P["engage_d"] or hit_us < 6 or (m["_closing"] and d < 180) or (m["_hpf"] < 0.4 and d < 160)
                       or (m["_aiming"] and d < 190))
+            if not ok and sec_kind == "laser" and hpf > P["laser_first_hp"] and d < P["laser_first_d"]:
+                ok = True  # open with a laser burst from range while healthy
             if not ok:
                 continue
             s = d + 0.18 * m.get("hp", 1400)
